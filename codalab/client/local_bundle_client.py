@@ -9,20 +9,32 @@ from codalab.bundles import (
 from codalab.common import (
   precondition,
   UsageError,
+    AuthorizationError,
+    PermissionError,
 )
 from codalab.client.bundle_client import BundleClient
 from codalab.lib import (
   canonicalize,
   path_util,
+  worksheet_util,
 )
 from codalab.objects.worksheet import Worksheet
+from codalab.objects import permission
+from codalab.objects.permission import Group
 
+def authentication_required(func):
+    def decorate(self, *args, **kwargs):
+        if self.auth_handler.current_user() is None:
+            raise AuthorizationError("Not authenticated")
+        return func(self, *args, **kwargs)
+    return decorate
 
 class LocalBundleClient(BundleClient):
-    def __init__(self, bundle_store, model):
-        self.address = 'local'
+    def __init__(self, address, bundle_store, model, auth_handler):
+        self.address = address
         self.bundle_store = bundle_store
         self.model = model
+        self.auth_handler = auth_handler
 
     def get_bundle_info(self, bundle, parents=None, children=None):
         hard_dependencies = bundle.get_hard_dependencies()
@@ -54,9 +66,9 @@ class LocalBundleClient(BundleClient):
         return canonicalize.get_worksheet_uuid(self.model, worksheet_spec)
 
     def expand_worksheet_item(self, item):
-        (bundle_spec, value) = item
+        (bundle_spec, value, type) = item
         if bundle_spec is None:
-            return (None, value or '')
+            return (None, value or '', type or '')
         try:
             bundle_uuid = self.get_spec_uuid(bundle_spec)
         except UsageError, e:
@@ -68,7 +80,7 @@ class LocalBundleClient(BundleClient):
             value = bundle_spec
             if getattr(bundle.metadata, 'description', None):
                 value = '%s: %s' % (value, bundle.metadata.description)
-        return (bundle_uuid, value or '')
+        return (bundle_uuid, value or '', type or '')
 
     def validate_user_metadata(self, bundle_subclass, metadata):
         '''
@@ -173,7 +185,7 @@ class LocalBundleClient(BundleClient):
     #############################################################################
 
     def new_worksheet(self, name):
-        worksheet = Worksheet({'name': name, 'items': []})
+        worksheet = Worksheet({'name': name, 'items': [], 'owner_id': None})
         self.model.save_worksheet(worksheet)
         return worksheet.uuid
 
@@ -185,19 +197,22 @@ class LocalBundleClient(BundleClient):
         # bundle info dicts. However, we still make O(1) database calls because we
         # use the optimized batch_get_bundles multiget method.
         uuids = set(
-          bundle_uuid for (bundle_uuid, _) in result['items']
+            bundle_uuid for (bundle_uuid, _, _) in result['items']
           if bundle_uuid is not None
         )
         bundles = self.model.batch_get_bundles(uuid=uuids)
         bundle_dict = {bundle.uuid: self.get_bundle_info(bundle) for bundle in bundles}
+
         # If a bundle uuid is orphaned, we still have to return the uuid in a dict.
+        items = []
         result['items'] = [
           (
                None if bundle_uuid is None else
                bundle_dict.get(bundle_uuid, {'uuid': bundle_uuid}),
-            value,
+                    worksheet_util.expand_worksheet_item_info(worksheet_spec, value, type),
+                    type,
           )
-          for (bundle_uuid, value) in result['items']
+            for (bundle_uuid, value, type) in result['items']
         ]
         return result
 
@@ -209,11 +224,11 @@ class LocalBundleClient(BundleClient):
         item_value = bundle_spec
         if getattr(bundle.metadata, 'description', None):
             item_value = '%s: %s' % (item_value, bundle.metadata.description)
-        item = (bundle.uuid, item_value)
+        item = (bundle.uuid, item_value, 'bundle')
         self.model.add_worksheet_item(worksheet_uuid, item)
 
     def update_worksheet(self, worksheet_info, new_items):
-        # Convert (bundle_spec, value) pairs into canonical (bundle_uuid, value) pairs.
+        # Convert (bundle_spec, value) pairs into canonical (bundle_uuid, value, type) pairs.
         # This step could take O(n) database calls! However, it will only hit the
         # database for each bundle the user has newly specified by name - bundles
         # that were already in the worksheet will be referred to by uuid, so
@@ -238,3 +253,98 @@ class LocalBundleClient(BundleClient):
     def delete_worksheet(self, worksheet_spec):
         uuid = self.get_worksheet_uuid(worksheet_spec)
         self.model.delete_worksheet(uuid)
+
+    #############################################################################
+    # Commands related to groups and permissions follow!
+    #############################################################################
+
+    def _current_user_id(self):
+        return self.auth_handler.current_user().unique_id
+
+    @authentication_required
+    def list_groups(self):
+        return self.model.batch_get_all_groups(
+            None, 
+            {'owner_id': self._current_user_id(), 'user_defined': True},
+            {'user_id': self._current_user_id() })
+
+    @authentication_required
+    def new_group(self, name):
+        group = Group({'name': name, 'user_defined': True, 'owner_id': self._current_user_id()})
+        self.model.create_group(group)
+        return group.to_dict()
+
+    @authentication_required
+    def rm_group(self, group_spec):
+        group_info = permission.unique_group_managed_by(self.model, group_spec, self._current_user_id())
+        self.model.delete_group(group_info['uuid'])
+        return group_info
+
+    @authentication_required
+    def group_info(self, group_spec):
+        group_info = permission.unique_group_with_user(self.model, group_spec, self._current_user_id())
+        users_in_group = self.model.batch_get_user_in_group(group_uuid=group_info['uuid'])
+        user_ids = [int(group_info['owner_id'])]
+        user_ids.extend([int(u['user_id']) for u in users_in_group])
+        users = self.auth_handler.get_users('ids', user_ids)
+        members = []
+        roles = {}
+        for row in users_in_group:
+            roles[int(row['user_id'])] = 'co-owner' if row['is_admin'] == True else 'member'
+        roles[group_info['owner_id']] = 'owner'
+        for user_id in user_ids:
+            if user_id in users:
+                user = users[user_id]
+                members.append({'name': user.name, 'role': roles[user_id]})
+        group_info['members'] = members
+        return group_info
+
+    @authentication_required
+    def add_user(self, username, group_spec, is_admin=False):
+        group_info = permission.unique_group_managed_by(self.model, group_spec, self._current_user_id())
+        users = self.auth_handler.get_users('names', [username])
+        user = users[username]
+        if user is None:
+            raise UsageError("%s is not a valid user." % (username,))
+        if user.unique_id == self._current_user_id():
+            raise UsageError("You cannot add yourself to a group.")
+        members = self.model.batch_get_user_in_group(user_id=user.unique_id, group_uuid=group_info['uuid'])
+        if len(members) > 0:
+            member = members[0]
+            if user.unique_id == group_info['owner_id']:
+                raise UsageError("You cannot modify the owner a group.")
+            if member['is_admin'] != is_admin:
+                self.model.update_user_in_group(user.unique_id, group_info['uuid'], is_admin)
+                member['operation'] = 'Modified'
+        else:
+            member = self.model.add_user_in_group(user.unique_id, group_info['uuid'], is_admin)
+            member['operation'] = 'Added'
+        member['name'] = username
+        return member
+
+    @authentication_required
+    def rm_user(self, username, group_spec):
+        group_info = permission.unique_group_managed_by(self.model, group_spec, self._current_user_id())
+        users = self.auth_handler.get_users('names', [username])
+        user = users[username]
+        if user is None:
+            raise UsageError("%s is not a valid user." % (username,))
+        if user.unique_id == group_info['owner_id']:
+            raise UsageError("You cannot modify the owner a group.")
+        members = self.model.batch_get_user_in_group(user_id=user.unique_id, group_uuid=group_info['uuid'])
+        if len(members) > 0:
+            member = members[0]
+            self.model.delete_user_in_group(user.unique_id, group_info['uuid'])
+            member['name'] = username
+            return member
+        return None
+
+    @authentication_required
+    def set_worksheet_perm(self, group_spec, worksheet_spec, permission):
+        pass
+        #TODO
+
+    @authentication_required
+    def set_bundle_perm(self, group_spec, bundle_spec, permission):
+        pass
+
