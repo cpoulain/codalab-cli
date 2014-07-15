@@ -81,11 +81,11 @@ def get_current_items(worksheet_info):
     Note: worksheet_info['items'] contains (bundle_info, value)
     '''
     items = []
-    for (bundle_info, value) in worksheet_info['items']:
+    for (bundle_info, value, type) in worksheet_info['items']:
         if bundle_info is None:
-            items.append((None, value))
+            items.append((None, value, type))
         else:
-            items.append((bundle_info['uuid'], value))
+            items.append((bundle_info['uuid'], value, type))
     return items
 
 

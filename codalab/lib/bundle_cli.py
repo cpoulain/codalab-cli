@@ -678,7 +678,9 @@ class BundleCLI(object):
         if args.bundle_spec:
             client.add_worksheet_item(worksheet_info['uuid'], args.bundle_spec)
         if args.message:
-            client.update_worksheet(worksheet_info, worksheet_util.get_current_items(worksheet_info) + [(None, args.message, None)])
+            new_items = worksheet_util.get_current_items(worksheet_info) \
+                      + worksheet_util.parse_worksheet_form([args.message])
+            client.update_worksheet(worksheet_info, new_items)
 
     def do_work_command(self, argv, parser):
         parser.add_argument(
@@ -692,17 +694,15 @@ class BundleCLI(object):
           help='Leave the current worksheet.',
         )
         args = parser.parse_args(argv)
-        if args.worksheet_spec:
-            client, worksheet_info = self.parse_client_worksheet_info(args.worksheet_spec)
-            if worksheet_info:
-                self.manager.set_current_worksheet_uuid(client, worksheet_info['uuid'])
-                print 'Switched to worksheet %s.' % (args.worksheet_spec,)
-            else:
-                self.manager.set_current_worksheet_uuid(client, None)
-                print 'Not on any worksheet. Use `cl new` or `cl work` to join one.'
-        elif args.exit:
+        if args.exit:
             self.manager.set_current_worksheet_uuid(self.manager.current_client(), None)
         else:
+            if args.worksheet_spec:
+                client, worksheet_info = self.parse_client_worksheet_info(args.worksheet_spec)
+                if worksheet_info:
+                    self.manager.set_current_worksheet_uuid(client, worksheet_info['uuid'])
+                else:
+                    self.manager.set_current_worksheet_uuid(client, None)
             worksheet_info = self.get_current_worksheet_info()
             if worksheet_info:
                 name = worksheet_info['name']
